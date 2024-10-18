@@ -1,0 +1,184 @@
+#!/bin/bash
+# wget_plone.sh -- created 2010-02-25, @davidjb
+# @Last Change: 2019-08-07
+# @contributors: J. Gutow <gutow@uwosh.edu>
+# @Revision:    3.0.0
+
+#USAGE: ./wget_plone.sh SITE_URL [username] [password]
+#When executed with a username and password, the script attempts to authenticate with the site
+#and obtain a session cookie for access.  When used without login credentials, the site is
+#copied anonymously.
+#
+#Joomla:
+#find . -name "pdf.html" -print0 | xargs -0 rename 's/pdf.html/article.pdf/g'
+#find . -name "*.html" -print0 | xargs -0 sed -i "s/pdf.html/article.pdf/g"
+
+GNUSED='sed'
+BROWSER_COMMAND="x-www-browser"
+[[ $OSTYPE == "darwin"*  ]] && GNUSED=gsed && BROWSER_COMMAND=open
+
+cookies_file="cookies-test.txt"
+login_file="login_form"
+
+function display_help {
+    echo "Usage: wget_plone.sh SITE_URL [USERNAME PASSWORD]
+    When executed with a username and password, the script
+    attempts to authenticate with the site and obtain a session
+    cookie for access.  When used without login credentials, the
+    site is copied anonymously."
+    exit 0
+}
+
+if [[ "$1" == "--help" ]] || [[ -z "$1" ]]; then
+    display_help
+fi
+
+function cleanup {
+    echo "Cleaning up files.  Please remain calm."
+    if [[ -e "$cookies_file" ]]; then
+        rm --verbose "$cookies_file"
+    fi
+
+    if [[ -e "$login_file" ]]; then
+        rm --verbose "$login_file"
+    fi
+
+    exit "$1"
+}
+
+# https://github.com/SixArm/urlencode.sh
+# License: MIT
+# Contact: Joel Parker Henderson (joel@joelparkerhenderson.com)
+urlencode() {
+    # urlencode <string>
+    old_lang=$LANG
+    LANG=C
+
+    old_lc_collate=$LC_COLLATE
+    LC_COLLATE=C
+
+    local length="${#1}"
+    for (( i = 0; i < length; i++ )); do
+        local c="${1:i:1}"
+        case $c in
+            [a-zA-Z0-9.~_-]) printf "%s" "$c" ;;
+            *) printf '%%%02X' "'$c" ;;
+        esac
+    done
+
+    LANG=$old_lang
+    LC_COLLATE=$old_lc_collate
+}
+
+
+# Get our Plone site down!
+# With authentication
+if [[ -n "$2" ]] && [[ -n "$3" ]]; then
+    echo "
+    WARNING: Do NOT attempt to Wget a site with an admin
+    user account or account with elevated privileges as this
+    process will hit ALL links on the site. You should only
+    attempt this process with AT MOST a 'Reader' account or
+    someone without Edit rights anywhere.
+    -----------------------------------------------------------
+    Consider yourself warned.  Do you wish to continue? (y/n)"
+    read -r -e acceptance
+
+    shopt -s nocasematch
+    if [[ "$acceptance" != "y" ]] && [[ "$acceptance" != "yes" ]]; then
+        exit 0
+    fi
+    shopt -u nocasematch
+
+    username=$(urlencode "$2")
+    password=$(urlencode "$3")
+    wget --keep-session-cookies \
+         --no-check-certificate \
+         --save-cookies "$cookies_file" \
+         --post-data "__ac_name=$username&__ac_password=$password&form.submitted=1&cookies_enabled=1&js_enabled=0" \
+         --output-document="$login_file" \
+         "$1/login_form"
+
+    if [[ $(wc -l < "$cookies_file") -lt 5 ]]; then
+        echo "Cookie file size too short.  Confirm that you entered the right username and password."
+        echo "Aborting wget process..."
+        cleanup 1
+    fi
+
+    wget --load-cookies $cookies_file \
+         --no-parent \
+         --no-check-certificate \
+         --adjust-extension \
+         --convert-links \
+         --restrict-file-names=windows \
+         --recursive \
+         --level=inf \
+         --page-requisites \
+         -e robots=off \
+         --wait=0 \
+         --quota=inf \
+         --reject "*_form,RSS,*login*,logged_in,*logout*,logged_out,createObject*,select_default_page,selectViewTemplate*,object_cut,object_copy,object_rename,delete_confirmation,content_status_*,addtoFavorites,pdf.html,print.html,*+add+*,@@personal-preferences,@@search" \
+         --exclude-directories="search,*com_mailto*" \
+         "$1"
+
+# Without authentication
+else
+    wget --no-parent \
+         --no-check-certificate \
+         --adjust-extension \
+         --convert-links \
+         --restrict-file-names=windows \
+         --recursive \
+         --level=inf \
+         --page-requisites \
+         -e robots=off \
+         --wait=0 \
+         --quota=inf \
+         --reject "*_form,RSS,*login*,logged_in,*logout*,logged_out,createObject*,select_default_page,selectViewTemplate*,object_cut,object_copy,object_rename,delete_confirmation,content_status_*,addtoFavorites,pdf.html,print.html,*+add+*,@@personal-preferences,@@search" \
+         --exclude-directories="search,*com_mailto*" \
+         "$1"
+fi
+
+#Normalise the folder name, removing protocol and any slashes from the end
+folder=$1
+folder=${folder##http://}
+folder=${folder##https://}
+folder=${folder%%/}
+#present wget version replaces ':' with '+', probably to avoid issues with
+#MacOS style paths.
+folder=${folder//:/+}
+
+#Start formatting our actual web address accordingly
+root_url=${1%%/}
+
+#Escape our site URL for use within the upcoming commands
+escaped_address=${root_url////\\\/}
+
+#Get and fix up references to images within CSS.
+pushd "$folder"/portal_css/*
+images=$(grep -R -h -o -E "$root_url/.*\.(png|gif|jpg|bmp|ico|tiff|svg|webp)" ./*)
+if [[ -n $images ]]; then
+    echo "${images}" | xargs wget -nc
+    find . -name "*.css" -exec $GNUSED -i "s/$escaped_address\///g" "{}" \;
+fi
+popd
+
+#Finally, remove any remaining absolute links.  These will include things we've exlcuded
+#such as login_form, sendto_form, search and so forth.  They will be replaced so they go
+#nowhere.
+echo "Fixing up any remaining absolute links to point to --> '#'..."
+find "$folder" -name "*.html" -exec $GNUSED -i -r "s/$escaped_address[a-zA-Z0-9\_\/\.\=\%\&\:\;\-]*/\#/g" "{}" \;
+
+echo "View in your default web browser? (y/n)"
+read -r -e acceptance
+
+shopt -s nocasematch
+if [[ $acceptance == "y" ]] || [[ $acceptance == "yes" ]]; then
+    $BROWSER_COMMAND "$folder/index.html" &
+fi
+shopt -u nocasematch
+
+echo -e "Wget process complete.  Your site is now available in the $folder directory."
+cleanup 0
+
+# vi:
